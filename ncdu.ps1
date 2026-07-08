@@ -666,9 +666,70 @@ function Draw-UI {
 
 #region -------- info / help / delete overlays --------
 
+# Keyboard-input abstraction. [Console]::ReadKey() throws
+# "Cannot read keys when either application does not have a console..." in
+# hosted PowerShell environments (PowerShell ISE most famously, and a few
+# input-redirected setups). $Host.UI.RawUI.ReadKey() covers more of those
+# hosts. We try Console first because it's faster and preserves modifier
+# keys; on the first InvalidOperation we latch onto the RawUI path.
+$Script:UseHostReadKey = $false
+
+# VK codes -> ConsoleKey-style names so the switch in Run-Browser stays
+# unchanged. Only the keys the UI reacts to are listed; anything else falls
+# through to the KeyChar dispatch.
+$Script:VK_TO_KEY = @{
+    0x08 = 'Backspace'
+    0x09 = 'Tab'
+    0x0D = 'Enter'
+    0x1B = 'Escape'
+    0x20 = 'Spacebar'
+    0x21 = 'PageUp'
+    0x22 = 'PageDown'
+    0x23 = 'End'
+    0x24 = 'Home'
+    0x25 = 'LeftArrow'
+    0x26 = 'UpArrow'
+    0x27 = 'RightArrow'
+    0x28 = 'DownArrow'
+}
+
+function Read-InteractiveKey {
+    if (-not $Script:UseHostReadKey) {
+        try {
+            $k = [Console]::ReadKey($true)
+            return [PSCustomObject]@{ Key = $k.Key.ToString(); KeyChar = $k.KeyChar }
+        } catch [System.InvalidOperationException] {
+            # No console — switch modes permanently and fall through.
+            $Script:UseHostReadKey = $true
+        }
+    }
+
+    try {
+        $k = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    } catch {
+        throw ("This PowerShell host does not support the interactive key input this " +
+               "script needs. Please run in Windows Terminal, powershell.exe, or " +
+               "pwsh.exe (PowerShell 7+) — PowerShell ISE is not supported.")
+    }
+
+    $vk   = [int]$k.VirtualKeyCode
+    $name = $Script:VK_TO_KEY[$vk]
+    if ($null -eq $name) { $name = '' }
+    return [PSCustomObject]@{ Key = $name; KeyChar = [char]$k.Character }
+}
+
+function Test-KeyAvailable {
+    if (-not $Script:UseHostReadKey) {
+        try { return [Console]::KeyAvailable }
+        catch [System.InvalidOperationException] { $Script:UseHostReadKey = $true }
+    }
+    try { return $Host.UI.RawUI.KeyAvailable }
+    catch { return $false }
+}
+
 function Wait-AnyKey {
-    while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
-    [void][Console]::ReadKey($true)
+    while (Test-KeyAvailable) { [void](Read-InteractiveKey) }
+    [void](Read-InteractiveKey)
 }
 
 function Show-Info {
@@ -751,8 +812,8 @@ function Confirm-Delete {
     Move-Cursor ($term.Height - 1) 0
     [Console]::Write((Style (Fit-Text $msg $term.Width) '1;31'))
 
-    while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) }
-    $key = [Console]::ReadKey($true)
+    while (Test-KeyAvailable) { [void](Read-InteractiveKey) }
+    $key = Read-InteractiveKey
     return ($key.KeyChar -eq 'y' -or $key.KeyChar -eq 'Y')
 }
 
@@ -807,7 +868,7 @@ function Run-Browser {
 
             Draw-UI -Node $current -Cursor $cursor -Scroll $scroll
 
-            $key = [Console]::ReadKey($true)
+            $key = Read-InteractiveKey
             $Script:StatusMessage = ''
 
             switch ($key.Key) {
@@ -927,6 +988,19 @@ function Run-Browser {
 }
 
 function Main {
+    # PowerShell ISE doesn't have a real console or a functional RawUI.ReadKey,
+    # so bail out with a clear message before the user sees a MethodInvocationException.
+    if ($Host.Name -match 'ISE') {
+        Write-Error @"
+PowerShell ISE cannot run this script -- it needs a real interactive console.
+Please run in one of:
+  - Windows Terminal
+  - powershell.exe (Windows PowerShell 5.1)
+  - pwsh.exe        (PowerShell 7+, recommended)
+"@
+        return
+    }
+
     $resolved = $null
     try {
         $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
