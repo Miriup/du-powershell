@@ -74,6 +74,12 @@ param(
 $Script:ESC = [char]27
 $Script:UseVT = -not $NoColor -and $Host.UI.SupportsVirtualTerminal
 
+# Opt into .NET's long-path support so File/Directory APIs don't throw
+# PathTooLongException on paths > 260 chars. Available on .NET Framework
+# 4.6.2+, which ships with Windows 10 / Server 2016+.
+try { [System.AppContext]::SetSwitch('Switch.System.IO.UseLegacyPathHandling', $false) } catch { }
+try { [System.AppContext]::SetSwitch('Switch.System.IO.BlockLongPaths', $false) } catch { }
+
 # Sort modes
 $Script:SortMode      = 'Size'   # Name | Size | Count
 $Script:SortDescending = $true
@@ -312,42 +318,74 @@ function Scan-Path {
             try { $hasNext = $enumerator.MoveNext() }
             catch {
                 $Script:ScanErrors++
-                if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : $($_.Exception.Message)" }
+                if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath (MoveNext) : $($_.Exception.Message)" }
                 break
             }
             if (-not $hasNext) { break }
-            $entry = $enumerator.Current
+
+            $entry = $null
+            try { $entry = $enumerator.Current } catch { }
+            if ($null -eq $entry) {
+                $Script:ScanErrors++
+                if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : enumerator returned null entry" }
+                Print-ScanStatus
+                continue
+            }
+
+            # Cache every property individually. On .NET Framework, FileSystemInfo
+            # properties like FullName can throw PathTooLongException for entries
+            # whose absolute path exceeds MAX_PATH — very common in Cassandra-style
+            # storage layouts (arcgisportal\db\...). If those throws escape into
+            # the outer catch or into an error-formatting expression, the whole
+            # entry silently fails to count. Cache first, then use.
+            $entryName     = $null
+            $entryFullName = $null
+            $entryAttrs    = 0
+            $entryIsDir    = $false
+            $entryLen      = [long]0
+
+            try { $entryName     = [string]$entry.Name }       catch { }
+            try { $entryFullName = [string]$entry.FullName }   catch { }
+            try { $entryAttrs    = [int]$entry.Attributes }    catch { }
+            try { $entryIsDir    = $entry -is [System.IO.DirectoryInfo] } catch { }
+            if (-not $entryIsDir) {
+                try { $entryLen = [long]$entry.Length } catch { }
+            }
+
+            if ([string]::IsNullOrEmpty($entryName) -or [string]::IsNullOrEmpty($entryFullName)) {
+                $Script:ScanErrors++
+                if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : could not read entry name/path (long path or reserved name?)" }
+                Print-ScanStatus
+                continue
+            }
+
+            if ($Script:SkipHidden -and (($entryAttrs -band $Script:ATTR_HIDDEN) -ne 0)) { Print-ScanStatus; continue }
+            if ($Script:SkipHidden -and (($entryAttrs -band $Script:ATTR_SYSTEM) -ne 0)) { Print-ScanStatus; continue }
 
             try {
-                $attrs = 0
-                try { $attrs = [int]$entry.Attributes } catch { $attrs = 0 }
-
-                if ($Script:SkipHidden -and (($attrs -band $Script:ATTR_HIDDEN) -ne 0)) { continue }
-                if ($Script:SkipHidden -and (($attrs -band $Script:ATTR_SYSTEM) -ne 0)) { continue }
-
-                if ($entry -is [System.IO.DirectoryInfo]) {
-                    $child = Scan-Path -AbsolutePath $entry.FullName
+                if ($entryIsDir) {
+                    $child = Scan-Path -AbsolutePath $entryFullName
                     $child.Parent = $node
                     [void]$node.Children.Add($child)
                     $node.Size += $child.Size
                     $node.ItemCount += $child.ItemCount + 1
                     $Script:ScanDirs++
                 } else {
-                    $len = [long]0
-                    try { $len = [long]$entry.Length } catch { $len = 0 }
-                    $fileNode = New-Node -Name $entry.Name -FullPath $entry.FullName -IsDirectory $false
-                    $fileNode.Size = $len
-                    $fileNode.IsReparsePoint = (($attrs -band $Script:ATTR_REPARSE) -ne 0)
+                    $fileNode = New-Node -Name $entryName -FullPath $entryFullName -IsDirectory $false
+                    $fileNode.Size = $entryLen
+                    $fileNode.IsReparsePoint = (($entryAttrs -band $Script:ATTR_REPARSE) -ne 0)
                     $fileNode.Parent = $node
                     [void]$node.Children.Add($fileNode)
-                    $node.Size += $len
+                    $node.Size += $entryLen
                     $node.ItemCount++
                     $Script:ScanFiles++
-                    $Script:ScanBytes += $len
+                    $Script:ScanBytes += $entryLen
                 }
             } catch {
                 $Script:ScanErrors++
-                if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$($entry.FullName) : $($_.Exception.Message)" }
+                # $entryFullName is already the cached safe copy — no property
+                # re-read here, so this line can never throw and escape.
+                if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$entryFullName : $($_.Exception.Message)" }
             }
             Print-ScanStatus
         }
