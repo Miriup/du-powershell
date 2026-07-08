@@ -35,6 +35,12 @@
 .PARAMETER NoColor
     Disable ANSI colors and reverse-video highlighting.
 
+.PARAMETER DebugLog
+    Path to a file. If given, every enumeration, every exception (with
+    .NET type + message), and every property-read failure is appended
+    here as the scan runs. Only enable this while diagnosing a scan
+    that isn't working — it slows things down noticeably.
+
 .EXAMPLE
     .\ncdu.ps1 C:\Users
 
@@ -66,7 +72,12 @@ param(
 
     [switch]$ExcludeHidden,
 
-    [switch]$NoColor
+    [switch]$NoColor,
+
+    # Path to a file. If given, every enumeration, exception (with type
+    # and message), and property-read failure is appended here. Use
+    # -DebugLog to figure out why a scan is producing all errors.
+    [string]$DebugLog
 )
 
 #region -------- constants & globals --------
@@ -94,6 +105,43 @@ $Script:FollowLinks   = $FollowReparsePoints.IsPresent
 
 # Runtime state
 $Script:StatusMessage = ''
+
+# Debug logging. All writes are cheap-guarded to a single boolean so the
+# hot path stays fast when logging is off.
+$Script:DebugEnabled = -not [string]::IsNullOrEmpty($DebugLog)
+$Script:DebugPath    = $DebugLog
+if ($Script:DebugEnabled) {
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($Script:DebugPath)
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            [void](New-Item -ItemType Directory -Path $dir -Force)
+        }
+        # Truncate & write header so each run starts fresh.
+        "=== ncdu-ps debug log $(Get-Date -Format o) ===" | Out-File -LiteralPath $Script:DebugPath -Encoding utf8
+    } catch {
+        Write-Warning "Could not open debug log '$Script:DebugPath': $($_.Exception.Message)"
+        $Script:DebugEnabled = $false
+    }
+}
+
+function Write-DebugLog {
+    param([string]$Msg)
+    if (-not $Script:DebugEnabled) { return }
+    try {
+        # System.IO.File.AppendAllText is 10-20x faster than Add-Content for
+        # per-entry logging and doesn't fight PowerShell's file locking model.
+        [System.IO.File]::AppendAllText($Script:DebugPath, $Msg + "`n", [System.Text.Encoding]::UTF8)
+    } catch { }
+}
+
+function Write-DebugException {
+    param([string]$Context, $ErrorRecord)
+    if (-not $Script:DebugEnabled) { return }
+    $ex = $ErrorRecord.Exception
+    $type = if ($ex) { $ex.GetType().FullName } else { '<no exception>' }
+    $msg  = if ($ex) { $ex.Message } else { '' }
+    Write-DebugLog ("EXC {0} :: {1} :: {2}" -f $Context, $type, $msg)
+}
 
 #endregion
 
@@ -273,6 +321,8 @@ function Test-IsDriveRoot {
 function Scan-Path {
     param([string]$AbsolutePath)
 
+    Write-DebugLog ("ENTER {0}" -f $AbsolutePath)
+
     $name = ''
     try { $name = [System.IO.Path]::GetFileName($AbsolutePath) } catch { }
     if ([string]::IsNullOrEmpty($name)) { $name = $AbsolutePath }
@@ -287,6 +337,7 @@ function Scan-Path {
         $rootAttrs = Get-SafeAttributes $AbsolutePath
         if ($null -ne $rootAttrs -and (($rootAttrs -band $Script:ATTR_REPARSE) -ne 0) -and -not $Script:FollowLinks) {
             $node.IsReparsePoint = $true
+            Write-DebugLog ("REPARSE {0} (attrs=0x{1:X})" -f $AbsolutePath, $rootAttrs)
             return $node
         }
     }
@@ -294,6 +345,7 @@ function Scan-Path {
     $dirInfo = $null
     try { $dirInfo = [System.IO.DirectoryInfo]::new($AbsolutePath) }
     catch {
+        Write-DebugException "DirectoryInfo::new($AbsolutePath)" $_
         $node.IsError = $true
         $Script:ScanErrors++
         if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : $($_.Exception.Message)" }
@@ -306,26 +358,32 @@ function Scan-Path {
     $enumerator = $null
     try { $enumerator = $dirInfo.EnumerateFileSystemInfos().GetEnumerator() }
     catch {
+        Write-DebugException "EnumerateFileSystemInfos($AbsolutePath)" $_
         $node.IsError = $true
         $Script:ScanErrors++
         if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : $($_.Exception.Message)" }
         return $node
     }
 
+    $processed = 0
     try {
         while ($true) {
             $hasNext = $false
             try { $hasNext = $enumerator.MoveNext() }
             catch {
+                Write-DebugException "MoveNext($AbsolutePath after $processed entries)" $_
                 $Script:ScanErrors++
                 if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath (MoveNext) : $($_.Exception.Message)" }
                 break
             }
             if (-not $hasNext) { break }
+            $processed++
 
             $entry = $null
-            try { $entry = $enumerator.Current } catch { }
+            $currentErr = $null
+            try { $entry = $enumerator.Current } catch { $currentErr = $_ }
             if ($null -eq $entry) {
+                Write-DebugException "Enumerator.Current($AbsolutePath entry #$processed)" $currentErr
                 $Script:ScanErrors++
                 if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : enumerator returned null entry" }
                 Print-ScanStatus
@@ -343,16 +401,18 @@ function Scan-Path {
             $entryAttrs    = 0
             $entryIsDir    = $false
             $entryLen      = [long]0
+            $propErr       = $null
 
-            try { $entryName     = [string]$entry.Name }       catch { }
-            try { $entryFullName = [string]$entry.FullName }   catch { }
-            try { $entryAttrs    = [int]$entry.Attributes }    catch { }
-            try { $entryIsDir    = $entry -is [System.IO.DirectoryInfo] } catch { }
+            try { $entryName     = [string]$entry.Name }       catch { $propErr = $_ }
+            try { $entryFullName = [string]$entry.FullName }   catch { if ($null -eq $propErr) { $propErr = $_ } }
+            try { $entryAttrs    = [int]$entry.Attributes }    catch { if ($null -eq $propErr) { $propErr = $_ } }
+            try { $entryIsDir    = $entry -is [System.IO.DirectoryInfo] } catch { if ($null -eq $propErr) { $propErr = $_ } }
             if (-not $entryIsDir) {
-                try { $entryLen = [long]$entry.Length } catch { }
+                try { $entryLen = [long]$entry.Length } catch { if ($null -eq $propErr) { $propErr = $_ } }
             }
 
             if ([string]::IsNullOrEmpty($entryName) -or [string]::IsNullOrEmpty($entryFullName)) {
+                Write-DebugException "PropertyRead in $AbsolutePath (entry #$processed, name='$entryName')" $propErr
                 $Script:ScanErrors++
                 if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : could not read entry name/path (long path or reserved name?)" }
                 Print-ScanStatus
@@ -382,6 +442,7 @@ function Scan-Path {
                     $Script:ScanBytes += $entryLen
                 }
             } catch {
+                Write-DebugException "Body($entryFullName, isDir=$entryIsDir)" $_
                 $Script:ScanErrors++
                 # $entryFullName is already the cached safe copy — no property
                 # re-read here, so this line can never throw and escape.
@@ -393,6 +454,7 @@ function Scan-Path {
         try { $enumerator.Dispose() } catch { }
     }
 
+    Write-DebugLog ("LEAVE {0} processed={1} size={2} items={3} errors={4}" -f $AbsolutePath, $processed, $node.Size, $node.ItemCount, $Script:ScanErrors)
     return $node
 }
 
