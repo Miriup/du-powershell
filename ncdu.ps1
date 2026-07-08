@@ -137,10 +137,17 @@ function Write-DebugLog {
 function Write-DebugException {
     param([string]$Context, $ErrorRecord)
     if (-not $Script:DebugEnabled) { return }
-    $ex = $ErrorRecord.Exception
+    if ($null -eq $ErrorRecord) { Write-DebugLog ("EXC {0} :: <no error record>" -f $Context); return }
+    $ex   = $ErrorRecord.Exception
     $type = if ($ex) { $ex.GetType().FullName } else { '<no exception>' }
     $msg  = if ($ex) { $ex.Message } else { '' }
-    Write-DebugLog ("EXC {0} :: {1} :: {2}" -f $Context, $type, $msg)
+    $line = '?'
+    $code = ''
+    if ($ErrorRecord.InvocationInfo) {
+        $line = $ErrorRecord.InvocationInfo.ScriptLineNumber
+        $code = ($ErrorRecord.InvocationInfo.Line -replace '\s+', ' ').Trim()
+    }
+    Write-DebugLog ("EXC {0} :: L{1} :: {2} :: {3} :: {4}" -f $Context, $line, $type, $msg, $code)
 }
 
 #endregion
@@ -245,6 +252,20 @@ function Make-Bar([double]$Fraction, [int]$Width) {
 
 function New-Node {
     param([string]$Name, [string]$FullPath, [bool]$IsDirectory)
+
+    # Create the list BEFORE the hashtable literal. Doing it inline —
+    #   Children = if ($IsDirectory) { [List[object]]::new() } else { $null }
+    # — hits a PowerShell 5.1 quirk where a hashtable value that evaluates to
+    # a freshly-constructed empty enumerable can be stored as $null on the
+    # resulting PSCustomObject, so $node.Children.Add(...) later blows up
+    # with "You cannot call a method on a null-valued expression." Assigning
+    # a plain reference sidesteps it.
+    #
+    # ArrayList (instead of List<object>) also avoids PS 5.1's occasional
+    # trouble resolving `List[object]` generic syntax at runtime.
+    $children = $null
+    if ($IsDirectory) { $children = [System.Collections.ArrayList]::new() }
+
     return [PSCustomObject]@{
         Name           = $Name
         FullPath       = $FullPath
@@ -253,8 +274,19 @@ function New-Node {
         IsDirectory    = $IsDirectory
         IsReparsePoint = $false
         IsError        = $false
-        Children       = if ($IsDirectory) { [System.Collections.Generic.List[object]]::new() } else { $null }
+        Children       = $children
         Parent         = $null
+    }
+}
+
+# Belt-and-braces: if Children ever slips back to $null on a directory node
+# (bug elsewhere, PS quirk, external code mucking with it), rebuild it before
+# the next Add so the whole scan doesn't fail on that entry. Logs the incident.
+function Ensure-ChildrenList {
+    param($Node)
+    if ($null -eq $Node.Children) {
+        Write-DebugLog ("SANITY: Children was null on {0}; recreating" -f $Node.FullPath)
+        $Node.Children = [System.Collections.ArrayList]::new()
     }
 }
 
@@ -423,6 +455,7 @@ function Scan-Path {
             if ($Script:SkipHidden -and (($entryAttrs -band $Script:ATTR_SYSTEM) -ne 0)) { Print-ScanStatus; continue }
 
             try {
+                Ensure-ChildrenList $node
                 if ($entryIsDir) {
                     $child = Scan-Path -AbsolutePath $entryFullName
                     $child.Parent = $node
