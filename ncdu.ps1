@@ -205,16 +205,22 @@ function New-Node {
 }
 
 # Progress state used by the scan
-$Script:ScanFiles = 0
-$Script:ScanDirs = 0
-$Script:ScanErrors = 0
-$Script:ScanBytes = 0L
-$Script:ScanTicker = 0
-$Script:ScanCurrent = ''
+$Script:ScanFiles     = 0
+$Script:ScanDirs      = 0
+$Script:ScanErrors    = 0
+$Script:ScanBytes     = 0L
+$Script:ScanTicker    = 0
+$Script:ScanCurrent   = ''
+$Script:LastErrorMsg  = ''       # first error encountered — surfaced in footer
+
+# Print progress every N iterations. Small N keeps the UI responsive but too
+# small burns time on Console.Write. 32 hits a good balance.
+$Script:ScanProgressEvery = 32
 
 function Print-ScanStatus {
+    param([switch]$Force)
     $Script:ScanTicker++
-    if (($Script:ScanTicker % 128) -ne 0) { return }
+    if (-not $Force -and (($Script:ScanTicker % $Script:ScanProgressEvery) -ne 0)) { return }
     $term = Get-TermSize
     Move-Cursor 0 0
     $line = ('Scanning... {0} files, {1} dirs, {2}, {3} errors  {4}' -f `
@@ -222,38 +228,102 @@ function Print-ScanStatus {
     [Console]::Write((Fit-Text $line $term.Width))
 }
 
+# Bit flags as plain ints — avoids surprises from PowerShell 5.1 enum arithmetic.
+$Script:ATTR_HIDDEN      = 0x2
+$Script:ATTR_SYSTEM      = 0x4
+$Script:ATTR_DIRECTORY   = 0x10
+$Script:ATTR_REPARSE     = 0x400
+
+# GetAttributes returns -1 (all bits) on Windows when the OS reports the file
+# exists but its attributes could not be retrieved — for drive roots on some
+# volumes this happens. Treat that as "unknown" so we don't flag it as a
+# reparse point (all-bits-set would otherwise match the reparse mask).
+function Get-SafeAttributes {
+    param([string]$Path)
+    try {
+        $a = [int]([System.IO.File]::GetAttributes($Path))
+        if ($a -eq -1) { return $null }
+        return $a
+    } catch {
+        return $null
+    }
+}
+
+function Test-IsDriveRoot {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) { return $false }
+    $p = $Path.TrimEnd('\', '/')
+    # "C:" style local root
+    if ($p.Length -eq 2 -and $p[1] -eq ':') { return $true }
+    # "\\server\share" style UNC root — 0, 1, or 2 segments after the "\\"
+    if ($Path.StartsWith('\\')) {
+        $rest  = $Path.Substring(2).TrimEnd('\', '/')
+        $parts = $rest.Split([char]'\', [StringSplitOptions]::RemoveEmptyEntries)
+        return ($parts.Length -le 2)
+    }
+    return $false
+}
+
 function Scan-Path {
     param([string]$AbsolutePath)
 
-    $name = try { [System.IO.Path]::GetFileName($AbsolutePath) } catch { $AbsolutePath }
+    $name = ''
+    try { $name = [System.IO.Path]::GetFileName($AbsolutePath) } catch { }
     if ([string]::IsNullOrEmpty($name)) { $name = $AbsolutePath }
 
     $node = New-Node -Name $name -FullPath $AbsolutePath -IsDirectory $true
     $Script:ScanCurrent = $AbsolutePath
 
-    try {
-        $dirInfo = [System.IO.DirectoryInfo]::new($AbsolutePath)
-
-        # Reparse point? Record size 0 unless the user asked us to follow.
-        if ((($dirInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) -and -not $Script:FollowLinks) {
+    # Reparse-point short circuit. Drive roots are never reparse points even if
+    # Windows momentarily says otherwise; skipping them here also avoids a nasty
+    # false positive when Attributes returns -1 (all bits set).
+    if (-not (Test-IsDriveRoot $AbsolutePath)) {
+        $rootAttrs = Get-SafeAttributes $AbsolutePath
+        if ($null -ne $rootAttrs -and (($rootAttrs -band $Script:ATTR_REPARSE) -ne 0) -and -not $Script:FollowLinks) {
             $node.IsReparsePoint = $true
             return $node
         }
+    }
 
-        $entries = $null
-        try {
-            $entries = $dirInfo.EnumerateFileSystemInfos()
-        } catch {
-            $node.IsError = $true
-            $Script:ScanErrors++
-            return $node
-        }
+    $dirInfo = $null
+    try { $dirInfo = [System.IO.DirectoryInfo]::new($AbsolutePath) }
+    catch {
+        $node.IsError = $true
+        $Script:ScanErrors++
+        if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : $($_.Exception.Message)" }
+        return $node
+    }
 
-        foreach ($entry in $entries) {
+    # Iterate with an explicit enumerator so a throw from MoveNext (which
+    # `foreach` cannot catch mid-iteration) is caught cleanly and the scan
+    # keeps whatever entries came before the failure.
+    $enumerator = $null
+    try { $enumerator = $dirInfo.EnumerateFileSystemInfos().GetEnumerator() }
+    catch {
+        $node.IsError = $true
+        $Script:ScanErrors++
+        if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : $($_.Exception.Message)" }
+        return $node
+    }
+
+    try {
+        while ($true) {
+            $hasNext = $false
+            try { $hasNext = $enumerator.MoveNext() }
+            catch {
+                $Script:ScanErrors++
+                if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$AbsolutePath : $($_.Exception.Message)" }
+                break
+            }
+            if (-not $hasNext) { break }
+            $entry = $enumerator.Current
+
             try {
-                $attrs = $entry.Attributes
-                if ($Script:SkipHidden -and (($attrs -band [System.IO.FileAttributes]::Hidden) -ne 0)) { continue }
-                if ($Script:SkipHidden -and (($attrs -band [System.IO.FileAttributes]::System) -ne 0)) { continue }
+                $attrs = 0
+                try { $attrs = [int]$entry.Attributes } catch { $attrs = 0 }
+
+                if ($Script:SkipHidden -and (($attrs -band $Script:ATTR_HIDDEN) -ne 0)) { continue }
+                if ($Script:SkipHidden -and (($attrs -band $Script:ATTR_SYSTEM) -ne 0)) { continue }
 
                 if ($entry -is [System.IO.DirectoryInfo]) {
                     $child = Scan-Path -AbsolutePath $entry.FullName
@@ -267,7 +337,7 @@ function Scan-Path {
                     try { $len = [long]$entry.Length } catch { $len = 0 }
                     $fileNode = New-Node -Name $entry.Name -FullPath $entry.FullName -IsDirectory $false
                     $fileNode.Size = $len
-                    $fileNode.IsReparsePoint = (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+                    $fileNode.IsReparsePoint = (($attrs -band $Script:ATTR_REPARSE) -ne 0)
                     $fileNode.Parent = $node
                     [void]$node.Children.Add($fileNode)
                     $node.Size += $len
@@ -277,12 +347,12 @@ function Scan-Path {
                 }
             } catch {
                 $Script:ScanErrors++
+                if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$($entry.FullName) : $($_.Exception.Message)" }
             }
             Print-ScanStatus
         }
-    } catch {
-        $node.IsError = $true
-        $Script:ScanErrors++
+    } finally {
+        try { $enumerator.Dispose() } catch { }
     }
 
     return $node
@@ -291,17 +361,19 @@ function Scan-Path {
 function Start-Scan {
     param([string]$AbsolutePath)
 
-    $Script:ScanFiles = 0
-    $Script:ScanDirs = 0
-    $Script:ScanErrors = 0
-    $Script:ScanBytes = 0L
-    $Script:ScanTicker = 0
+    $Script:ScanFiles    = 0
+    $Script:ScanDirs     = 0
+    $Script:ScanErrors   = 0
+    $Script:ScanBytes    = 0L
+    $Script:ScanTicker   = 0
+    $Script:LastErrorMsg = ''
 
     Clear-Screen
     Move-Cursor 0 0
     [Console]::Write("Scanning $AbsolutePath ...")
 
     $root = Scan-Path -AbsolutePath $AbsolutePath
+    Print-ScanStatus -Force
     return $root
 }
 
@@ -363,6 +435,9 @@ function Draw-Footer {
     if ($Script:StatusMessage) {
         Move-Cursor ($Row + 1) 0
         [Console]::Write((Fit-Text (' ' + $Script:StatusMessage) $Width))
+    } elseif ($Script:LastErrorMsg -and $Script:ScanErrors -gt 0) {
+        Move-Cursor ($Row + 1) 0
+        [Console]::Write((Style (Fit-Text (' first error: ' + $Script:LastErrorMsg) $Width) '31'))
     }
 }
 
@@ -423,7 +498,8 @@ function Draw-UI {
     Draw-Header $Node.FullPath $width
 
     $listTop = 1
-    $footerRows = if ($Script:StatusMessage) { 2 } else { 1 }
+    $hasSecondFooterRow = ($Script:StatusMessage) -or ($Script:LastErrorMsg -and $Script:ScanErrors -gt 0)
+    $footerRows = if ($hasSecondFooterRow) { 2 } else { 1 }
     $listRows = $height - $listTop - $footerRows
     if ($listRows -lt 1) { $listRows = 1 }
 
@@ -587,7 +663,8 @@ function Run-Browser {
 
         while ($true) {
             $term = Get-TermSize
-            $listRows = $term.Height - 1 - ($(if ($Script:StatusMessage) { 2 } else { 1 }))
+            $hasSecondFooterRow = ($Script:StatusMessage) -or ($Script:LastErrorMsg -and $Script:ScanErrors -gt 0)
+            $listRows = $term.Height - 1 - ($(if ($hasSecondFooterRow) { 2 } else { 1 }))
             if ($listRows -lt 1) { $listRows = 1 }
             $count = if ($current.Children) { $current.Children.Count } else { 0 }
 
