@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 # ncdu-ps -- ncdu-style hierarchical disk usage browser for Windows PowerShell.
 # Copyright (C) 2026  ncdu-ps contributors
 #
@@ -39,7 +39,7 @@
     Path to a file. If given, every enumeration, every exception (with
     .NET type + message), and every property-read failure is appended
     here as the scan runs. Only enable this while diagnosing a scan
-    that isn't working — it slows things down noticeably.
+    that isn't working -- it slows things down noticeably.
 
 .EXAMPLE
     .\ncdu.ps1 C:\Users
@@ -253,9 +253,9 @@ function Make-Bar([double]$Fraction, [int]$Width) {
 function New-Node {
     param([string]$Name, [string]$FullPath, [bool]$IsDirectory)
 
-    # Create the list BEFORE the hashtable literal. Doing it inline —
+    # Create the list BEFORE the hashtable literal. Doing it inline --
     #   Children = if ($IsDirectory) { [List[object]]::new() } else { $null }
-    # — hits a PowerShell 5.1 quirk where a hashtable value that evaluates to
+    # -- hits a PowerShell 5.1 quirk where a hashtable value that evaluates to
     # a freshly-constructed empty enumerable can be stored as $null on the
     # resulting PSCustomObject, so $node.Children.Add(...) later blows up
     # with "You cannot call a method on a null-valued expression." Assigning
@@ -297,7 +297,7 @@ $Script:ScanErrors    = 0
 $Script:ScanBytes     = 0L
 $Script:ScanTicker    = 0
 $Script:ScanCurrent   = ''
-$Script:LastErrorMsg  = ''       # first error encountered — surfaced in footer
+$Script:LastErrorMsg  = ''       # first error encountered -- surfaced in footer
 
 # Print progress every N iterations. Small N keeps the UI responsive but too
 # small burns time on Console.Write. 32 hits a good balance.
@@ -314,14 +314,14 @@ function Print-ScanStatus {
     [Console]::Write((Fit-Text $line $term.Width))
 }
 
-# Bit flags as plain ints — avoids surprises from PowerShell 5.1 enum arithmetic.
+# Bit flags as plain ints -- avoids surprises from PowerShell 5.1 enum arithmetic.
 $Script:ATTR_HIDDEN      = 0x2
 $Script:ATTR_SYSTEM      = 0x4
 $Script:ATTR_DIRECTORY   = 0x10
 $Script:ATTR_REPARSE     = 0x400
 
 # GetAttributes returns -1 (all bits) on Windows when the OS reports the file
-# exists but its attributes could not be retrieved — for drive roots on some
+# exists but its attributes could not be retrieved -- for drive roots on some
 # volumes this happens. Treat that as "unknown" so we don't flag it as a
 # reparse point (all-bits-set would otherwise match the reparse mask).
 function Get-SafeAttributes {
@@ -341,7 +341,7 @@ function Test-IsDriveRoot {
     $p = $Path.TrimEnd('\', '/')
     # "C:" style local root
     if ($p.Length -eq 2 -and $p[1] -eq ':') { return $true }
-    # "\\server\share" style UNC root — 0, 1, or 2 segments after the "\\"
+    # "\\server\share" style UNC root -- 0, 1, or 2 segments after the "\\"
     if ($Path.StartsWith('\\')) {
         $rest  = $Path.Substring(2).TrimEnd('\', '/')
         $parts = $rest.Split([char]'\', [StringSplitOptions]::RemoveEmptyEntries)
@@ -424,7 +424,7 @@ function Scan-Path {
 
             # Cache every property individually. On .NET Framework, FileSystemInfo
             # properties like FullName can throw PathTooLongException for entries
-            # whose absolute path exceeds MAX_PATH — very common in Cassandra-style
+            # whose absolute path exceeds MAX_PATH -- very common in Cassandra-style
             # storage layouts (arcgisportal\db\...). If those throws escape into
             # the outer catch or into an error-formatting expression, the whole
             # entry silently fails to count. Cache first, then use.
@@ -477,7 +477,7 @@ function Scan-Path {
             } catch {
                 Write-DebugException "Body($entryFullName, isDir=$entryIsDir)" $_
                 $Script:ScanErrors++
-                # $entryFullName is already the cached safe copy — no property
+                # $entryFullName is already the cached safe copy -- no property
                 # re-read here, so this line can never throw and escape.
                 if (-not $Script:LastErrorMsg) { $Script:LastErrorMsg = "$entryFullName : $($_.Exception.Message)" }
             }
@@ -555,7 +555,7 @@ function Draw-Footer {
     Move-Cursor $Row 0
     $left = ' Total disk usage: {0}  Items: {1}  Errors: {2} ' -f `
         (Format-Size $Node.Size).Trim(), $Node.ItemCount, $Script:ScanErrors
-    $right = ' n/s/C sort | Enter open | ← up | d del | r rescan | ? help | q quit '
+    $right = ' n/s/C sort | Enter open | <- up | d del | r rescan | ? help | q quit '
 
     $mid = $Width - $left.Length - $right.Length
     if ($mid -lt 1) {
@@ -699,7 +699,7 @@ function Read-InteractiveKey {
             $k = [Console]::ReadKey($true)
             return [PSCustomObject]@{ Key = $k.Key.ToString(); KeyChar = $k.KeyChar }
         } catch [System.InvalidOperationException] {
-            # No console — switch modes permanently and fall through.
+            # No console -- switch modes permanently and fall through.
             $Script:UseHostReadKey = $true
         }
     }
@@ -709,7 +709,7 @@ function Read-InteractiveKey {
     } catch {
         throw ("This PowerShell host does not support the interactive key input this " +
                "script needs. Please run in Windows Terminal, powershell.exe, or " +
-               "pwsh.exe (PowerShell 7+) — PowerShell ISE is not supported.")
+               "pwsh.exe (PowerShell 7+) -- PowerShell ISE is not supported.")
     }
 
     $vk   = [int]$k.VirtualKeyCode
